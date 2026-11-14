@@ -1,0 +1,43 @@
+# disktwin configuration
+# Copy this file to "disktwin.conf", fill it in and run: sudo ./install.sh
+# The installer copies it to /etc/disktwin.conf, which is where the commands read it from.
+#
+# To find UUIDs and disk IDs:
+#   lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINTS
+#   ls -l /dev/disk/by-id/ | grep -v -- -part
+
+# User who receives notifications and runs the mirror
+NOTIFY_USER=your_user
+
+# SOURCE partition (the one being copied)
+SOURCE_UUID=XXXX-XXXX
+
+# TARGET partition (the twin) and where it must be mounted
+TARGET_UUID=XXXXXXXXXXXXXXXX
+TARGET_MOUNT=/mnt/twin
+
+# If a sync would delete more than N files on the twin, it is blocked and you get an alert
+# (to go ahead anyway: disktwin-sync --force)
+MAX_DELETE=2000
+
+# Seconds without changes to wait before syncing (batches bursts of changes)
+SETTLE_SECONDS=3
+
+# Patterns (rsync style) that are not copied
+EXCLUDE=(.Spotlight-V100 .fseventsd .Trashes '.Trash-*')
+
+# Pending alerts directory
+ALERTS_DIR=/var/lib/disktwin/alerts
+
+# Language of alerts and messages: auto (from LANG), es or en
+DISKTWIN_LANG=auto
+
+# Disks monitored with SMART (/dev/disk/by-id/... paths). NVMe disks are detected by name.
+SMART_DISKS=(
+  /dev/disk/by-id/ata-MODEL_SERIAL
+  /dev/disk/by-id/nvme-MODEL_SERIAL
+)
+# smartd options for SATA (HDD/SSD) and NVMe disks:
+# short self-test daily at 03:00, long one on Sundays at 04:00; temperature alerts at 60 / 80 ºC
+SMART_OPTS_ATA='-a -o on -S on -n standby,q -s (S/../.././03|L/../../7/04) -W 4,50,60'
+SMART_OPTS_NVME='-d nvme -a -W 5,70,80'

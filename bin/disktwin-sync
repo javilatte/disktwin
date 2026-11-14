@@ -1,0 +1,125 @@
+#!/bin/bash
+# disktwin-sync: one-way mirror SOURCE -> TARGET using rsync.
+# Whatever is added, changed or deleted on the source is replicated on the twin.
+#   disktwin-sync               full sync (blocks mass deletions above MAX_DELETE files)
+#   disktwin-sync --force       full sync without the deletion limit
+#   disktwin-sync --cron        same as no arguments (for the cron job)
+#   disktwin-sync --paths FILE  sync only what FILE lists (used by disktwin-watch).
+#                               One entry per line, "TYPE<tab>dir" relative to the source:
+#                                 D  only the direct contents of dir (changed/deleted files)
+#                                 R  the whole dir, recursively (new or moved-in dirs)
+#                               "R<tab>." means a full sync.
+set -u
+lang_env=${DISKTWIN_LANG:-}   # DISKTWIN_LANG from the environment wins over the config
+CONF=${DISKTWIN_CONF:-/etc/disktwin.conf}
+# shellcheck source=/dev/null
+source "$CONF" || { echo "Cannot read $CONF" >&2; exit 2; }
+ALERTS_DIR=${ALERTS_DIR:-/var/lib/disktwin/alerts}
+case ${lang_env:-${DISKTWIN_LANG:-auto}} in
+  es|en) L=${lang_env:-$DISKTWIN_LANG} ;;
+  *) [[ ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} == es* ]] && L=es || L=en ;;
+esac
+m() { if [[ $L == es ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/disktwin
+LOG=$STATE/sync.log
+mkdir -p "$STATE"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+alert() { /usr/local/bin/disktwin-alert -k "sync-$1" "disktwin: $2" "$3"; log "ALERT: $2 - $3"; }
+clear_alerts() { rm -f "$ALERTS_DIR"/pending/sync-*.txt 2>/dev/null; }
+
+opts=(--max-delete="$MAX_DELETE")
+paths_file=""
+case ${1:-} in
+  --force) opts=() ;;
+  --paths) paths_file=${2:?missing paths file} ;;
+  -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+for p in "${EXCLUDE[@]}"; do opts+=(--exclude="$p"); done
+
+# Only one rsync at a time; if another is running, wait (up to 2 h).
+exec 9>"$STATE/lock"
+flock -w 7200 9 || { log "another sync is still running; exiting"; exit 0; }
+
+# Safety: find both partitions by UUID. If the source is not mounted, do NOT sync,
+# so the twin is never emptied against an empty directory.
+SRC=$(lsblk -no MOUNTPOINT "/dev/disk/by-uuid/$SOURCE_UUID" 2>/dev/null | head -1)
+DST=$(lsblk -no MOUNTPOINT "/dev/disk/by-uuid/$TARGET_UUID" 2>/dev/null | head -1)
+if [[ -z $SRC ]]; then
+  alert source "$(m "el origen no está montado" "source not mounted")" \
+    "$(m "La partición de origen (UUID $SOURCE_UUID) no está montada o no se detecta. No se ha sincronizado." \
+         "Source partition (UUID $SOURCE_UUID) is not mounted or not detected. Nothing was synced.")"
+  exit 1
+fi
+if [[ -z $DST || $DST != "$TARGET_MOUNT" ]]; then
+  alert target "$(m "la copia no está montada" "twin not mounted")" \
+    "$(m "La partición de destino (UUID $TARGET_UUID) no está montada en $TARGET_MOUNT (está en: '${DST:-ninguno}'). No se ha sincronizado." \
+         "Target partition (UUID $TARGET_UUID) is not mounted at $TARGET_MOUNT (found at: '${DST:-none}'). Nothing was synced.")"
+  exit 1
+fi
+
+run_rsync() {   # run_rsync RSYNC_MODE SOURCE...  (accumulates output and exit code)
+  local mode=$1; shift
+  local s r
+  s=$(rsync "$mode" -t --delete --delete-delay --modify-window=1 "${opts[@]}" \
+      --itemize-changes "$@" "$DST/" 2>&1)
+  r=$?
+  output+=$s$'\n'
+  [[ $rc == 0 || $rc == 24 ]] && rc=$r
+}
+output=""; rc=0
+start=$(date +%s)
+
+declare -A dir_d=() dir_r=()
+if [[ -n $paths_file ]]; then
+  while IFS=$'\t' read -r type d; do
+    [[ -z ${d:-} ]] && continue
+    d=${d#./}; d=${d%/}; [[ -z $d ]] && d=.
+    # Gone (deleted or moved away)? Checking the direct contents of the nearest
+    # ancestor that still exists is enough to delete it on the twin.
+    if [[ $d != . && ! -d $SRC/$d ]]; then
+      type=D; while [[ $d != . && ! -d $SRC/$d ]]; do d=$(dirname "$d"); done
+    fi
+    if [[ $type == R ]]; then dir_r[$d]=1; else dir_d[$d]=1; fi
+  done < "$paths_file"
+fi
+
+if [[ -z $paths_file || -n ${dir_r[.]:-} ]]; then
+  mode=full
+  run_rsync -r "$SRC/"
+else
+  # Recursive: drop dirs already inside another recursive one.
+  src_r=(); prev=""
+  while IFS= read -r d; do
+    [[ -z $d ]] && continue
+    [[ -n $prev && $d == "$prev"/* ]] && continue
+    src_r+=("$SRC/./$d/"); prev=$d
+  done < <(printf '%s\n' "${!dir_r[@]}" | LC_ALL=C sort)
+  # Direct: drop dirs already covered by a recursive one.
+  src_d=()
+  for d in "${!dir_d[@]}"; do
+    covered=0
+    for r in "${!dir_r[@]}"; do [[ $d == "$r" || $d == "$r"/* ]] && { covered=1; break; }; done
+    (( covered )) || src_d+=("$SRC/./$d/")
+  done
+  opts+=(--relative)
+  (( ${#src_d[@]} )) && run_rsync -d "${src_d[@]}"
+  (( ${#src_r[@]} )) && run_rsync -r "${src_r[@]}"
+  mode="partial (${#src_d[@]} dirs + ${#src_r[@]} recursive)"
+fi
+changes=$(grep -c '^[<>*ch.]' <<<"$output")
+case $rc in
+  0|24)   # 24 = files vanished during the transfer (normal while files are being moved)
+    log "OK $mode ($changes changes, $(( $(date +%s) - start ))s)"
+    clear_alerts ;;
+  25)
+    alert delete "$(m "borrado masivo bloqueado" "mass deletion blocked")" \
+      "$(m "Se iban a borrar más de $MAX_DELETE archivos en la copia. Si es intencionado, ejecuta: disktwin-sync --force" \
+           "More than $MAX_DELETE files were about to be deleted on the twin. If intended, run: disktwin-sync --force")"
+    exit $rc ;;
+  *)
+    alert rsync "$(m "error de rsync" "rsync error") ($rc)" "$(grep -iE 'error|failed' <<<"$output" | head -3)"
+    log "$output"
+    exit $rc ;;
+esac
