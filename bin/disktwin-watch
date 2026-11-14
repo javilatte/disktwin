@@ -1,0 +1,51 @@
+#!/bin/bash
+# disktwin-watch: watch the source with inotify and, as soon as something changes,
+# sync only what was affected (waits SETTLE_SECONDS without changes to batch bursts,
+# e.g. while a whole folder is being copied). The hourly cron job does the full check.
+CONF=${DISKTWIN_CONF:-/etc/disktwin.conf}
+# shellcheck source=/dev/null
+source "$CONF" || { echo "Cannot read $CONF" >&2; exit 2; }
+MAX_DIRS=500   # more changed dirs than this in one batch -> full sync
+SYNC_BIN=${DISKTWIN_SYNC_BIN:-/usr/local/bin/disktwin-sync}   # overridable for testing
+
+# Turn the EXCLUDE globs into a regular expression for inotifywait
+parts=()
+for p in "${EXCLUDE[@]}"; do
+  parts+=("$(sed -e 's/[.+^$(){}|[\]/\\&/g' -e 's/\*/[^\/]*/g' -e 's/?/[^\/]/g' <<<"$p")")
+done
+EXCL="/($(IFS='|'; echo "${parts[*]}"))(/|\$)"
+
+LIST=$(mktemp -t disktwin-paths.XXXXXX)
+trap 'rm -f "$LIST"' EXIT
+
+while true; do
+  SRC=$(lsblk -no MOUNTPOINT "/dev/disk/by-uuid/$SOURCE_UUID" 2>/dev/null | head -1)
+  if [[ -z $SRC ]]; then sleep 30; continue; fi   # source not mounted: wait (cron alerts)
+  "$SYNC_BIN"                                     # full sync on start, in case of unwatched changes
+  echo "watching $SRC"
+  # Each event: "EVENTS|path". Changed/deleted file -> check its dir (D, not recursive).
+  # Dir created or moved in -> copy it whole (R).
+  inotifywait -m -r -q -e close_write,create,delete,move,attrib --exclude "$EXCL" --format '%e|%w%f' "$SRC" |
+  while IFS='|' read -r ev path; do
+    declare -A dir_d=() dir_r=()
+    while :; do
+      rel=${path#"$SRC"}; rel=${rel#/}; rel=${rel%/}
+      if [[ -z $rel ]]; then dir_d[.]=1
+      else
+        if [[ $rel == */* ]]; then dir_d[${rel%/*}]=1; else dir_d[.]=1; fi
+        [[ $ev == *ISDIR* && ( $ev == *CREATE* || $ev == *MOVED_TO* ) ]] && dir_r[$rel]=1
+      fi
+      IFS='|' read -r -t "$SETTLE_SECONDS" ev path || break   # batch changes until things settle
+    done
+    if (( ${#dir_d[@]} + ${#dir_r[@]} > MAX_DIRS )); then
+      printf 'R\t.\n' > "$LIST"
+    else
+      { for d in "${!dir_d[@]}"; do printf 'D\t%s\n' "$d"; done
+        for d in "${!dir_r[@]}"; do printf 'R\t%s\n' "$d"; done; } > "$LIST"
+    fi
+    unset dir_d dir_r
+    "$SYNC_BIN" --paths "$LIST"
+  done
+  echo "inotifywait exited (source unmounted?); retrying"
+  sleep 10
+done

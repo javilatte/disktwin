@@ -1,0 +1,12 @@
+[Unit]
+Description=disktwin: real-time one-way mirror of the source disk to its twin (inotify + rsync)
+
+[Service]
+ExecStart=/usr/local/bin/disktwin-watch
+Restart=always
+RestartSec=30
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
