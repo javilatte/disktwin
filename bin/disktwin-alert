@@ -1,0 +1,50 @@
+#!/bin/bash
+# disktwin-alert: record a disk alert and show it as a desktop notification.
+#   disktwin-alert [-k key] "Title" "Message"
+#   When called by smartd (SMARTD_* env vars set) it builds the alert from them.
+# Alerts stay in $ALERTS_DIR/pending until acknowledged with `disktwin-alerts --ok`;
+# until then they are shown every time a terminal is opened.
+lang_env=${DISKTWIN_LANG:-}   # DISKTWIN_LANG from the environment wins over the config
+CONF=${DISKTWIN_CONF:-/etc/disktwin.conf}
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && source "$CONF"
+ALERTS_DIR=${ALERTS_DIR:-/var/lib/disktwin/alerts}
+NOTIFY_USER=${NOTIFY_USER:-$(id -un 1000)}
+case ${lang_env:-${DISKTWIN_LANG:-auto}} in
+  es|en) L=${lang_env:-$DISKTWIN_LANG} ;;
+  *) [[ ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} == es* ]] && L=es || L=en ;;
+esac
+m() { if [[ $L == es ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+DIR=$ALERTS_DIR/pending
+key=""
+if [[ ${1:-} == -k ]]; then key=$2; shift 2; fi
+
+if [[ -n ${SMARTD_DEVICE:-} ]]; then   # called by smartd (its arguments are ignored)
+  title="SMART: $(m "problema en" "problem on") ${SMARTD_DEVICEINFO:-$SMARTD_DEVICE}"
+  message="[$SMARTD_FAILTYPE] $SMARTD_DEVICE: $SMARTD_MESSAGE"
+  key="smart-${SMARTD_DEVICE//\//_}-$SMARTD_FAILTYPE"
+else
+  title=${1:-$(m "Alerta de disco" "Disk alert")}
+  message=${2:-}
+fi
+
+mkdir -p "$DIR" 2>/dev/null
+f="$DIR/${key:-$(date +%s)-$$}.txt"
+new=1; [[ -n $key && -e $f ]] && new=0
+{
+  echo "$(date '+%Y-%m-%d %H:%M:%S')  $title"
+  echo "  $message"
+} > "$f"
+chmod 664 "$f" 2>/dev/null
+# An alert with the same key that is still pending is updated but not re-notified.
+[[ $new == 0 ]] && exit 0
+
+uid=$(id -u "$NOTIFY_USER")
+args=(-u critical -a disktwin -i drive-harddisk "$title" "$message")
+if [[ $(id -u) == "$uid" ]]; then
+  DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$uid/bus} notify-send "${args[@]}" 2>/dev/null
+elif [[ $(id -u) == 0 && -S /run/user/$uid/bus ]]; then
+  runuser -u "$NOTIFY_USER" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" notify-send "${args[@]}" 2>/dev/null
+fi
+exit 0

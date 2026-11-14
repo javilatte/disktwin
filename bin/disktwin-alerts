@@ -1,0 +1,49 @@
+#!/bin/bash
+# disktwin-alerts: check pending disk alerts.
+#   disktwin-alerts             list pending alerts
+#   disktwin-alerts --summary   short banner (run from ~/.bashrc when a terminal opens)
+#   disktwin-alerts --notify    desktop notification if any are pending (at login)
+#   disktwin-alerts --ok        acknowledge all (moved to ../seen)
+lang_env=${DISKTWIN_LANG:-}   # DISKTWIN_LANG from the environment wins over the config
+CONF=${DISKTWIN_CONF:-/etc/disktwin.conf}
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && source "$CONF"
+ALERTS_DIR=${ALERTS_DIR:-/var/lib/disktwin/alerts}
+case ${lang_env:-${DISKTWIN_LANG:-auto}} in
+  es|en) L=${lang_env:-$DISKTWIN_LANG} ;;
+  *) [[ ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} == es* ]] && L=es || L=en ;;
+esac
+m() { if [[ $L == es ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+DIR=$ALERTS_DIR/pending
+SEEN=$ALERTS_DIR/seen
+shopt -s nullglob
+files=("$DIR"/*.txt)
+n=${#files[@]}
+
+case ${1:-} in
+  --summary)
+    (( n == 0 )) && exit 0
+    printf '\e[1;41;97m ⚠  disktwin: %d %s \e[0m\n' "$n" "$(m "ALERTA(S) DE DISCO PENDIENTE(S)" "PENDING DISK ALERT(S)")"
+    for f in "${files[@]}"; do sed 's/^/  /' "$f"; done
+    printf '\e[2m  (%s: disktwin-alerts --ok)\e[0m\n\n' "$(m "marcar como vistas" "acknowledge")"
+    ;;
+  --notify)
+    (( n == 0 )) && exit 0
+    notify-send -u critical -a disktwin -i drive-harddisk \
+      "disktwin: $n $(m "alerta(s) de disco pendiente(s)" "pending disk alert(s)")" \
+      "$(head -qn1 "${files[@]}" | cut -c22-)"
+    ;;
+  --ok)
+    mkdir -p "$SEEN"
+    for f in "${files[@]}"; do mv "$f" "$SEEN/$(date +%Y%m%d-%H%M%S)-$(basename "$f")"; done
+    echo "$n $(m "alerta(s) marcadas como vistas." "alert(s) acknowledged.")"
+    ;;
+  -h|--help)
+    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    (( n == 0 )) && { m "Sin alertas pendientes." "No pending alerts."; echo; exit 0; }
+    for f in "${files[@]}"; do cat "$f"; echo; done
+    ;;
+esac

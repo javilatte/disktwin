@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=disktwin alerts
+Name[es]=Alertas de disktwin
+Comment=Notify at login if there are pending disk alerts
+Comment[es]=Avisa al iniciar sesión si hay alertas de disco pendientes
+Exec=sh -c "sleep 20; /usr/local/bin/disktwin-alerts --notify"
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
